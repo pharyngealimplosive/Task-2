@@ -267,11 +267,20 @@ class IPAProcessor:
         }
     
     def detect_ipa_brackets(self, segment: str) -> Tuple[Optional[str], Optional[str], str, Optional[str]]:
-        """Fast bracket detection with consolidated logic."""
+        """Fast bracket detection with consolidated logic and special slash handling."""
         segment = segment.strip()
         
-        # Check all brackets in order of priority
+        # Special handling for slashes - check if they form phonemic brackets
+        if segment.startswith('/') and segment.endswith('/') and segment.count('/') == 2:
+            # This is a phonemic transcription like /x~y/ - treat as IPA brackets
+            content = segment[1:-1].strip()
+            template_name = self.special_brackets.get('/', (None, None))[1] if '/' in self.special_brackets else None
+            return '/', '/', content, template_name
+        
+        # Check all other brackets in order of priority (excluding slashes for now)
         for open_b in self.brackets:
+            if open_b == '/':  # Skip slashes, handled above
+                continue
             close_b = self.brackets[open_b]
             if segment.startswith(open_b) and segment.endswith(close_b):
                 content = segment[len(open_b):-len(close_b)].strip()
@@ -279,16 +288,71 @@ class IPAProcessor:
                 return open_b, close_b, content, template_name
         
         return None, None, segment, None
+
+    def _should_treat_slash_as_separator(self, content: str) -> bool:
+        """Determine if slashes in content should be treated as allophone separators."""
+        slash_count = content.count('/')
+        
+        # If no slashes, not relevant
+        if slash_count == 0:
+            return False
+        
+        # If content is already bracketed with slashes and only has 2 slashes total, 
+        # those are the bracket slashes, not separators
+        if content.startswith('/') and content.endswith('/') and slash_count == 2:
+            return False
+        
+        # If more than 2 slashes, or slashes inside other brackets, treat as separators
+        if slash_count > 2:
+            return True
+        
+        # If content has slashes but isn't bracketed with them, treat as separators
+        if slash_count >= 1 and not (content.startswith('/') and content.endswith('/')):
+            return True
+        
+        # Check if slashes appear alongside other separators (strong indicator of separator usage)
+        other_separators = [sep for sep in self.separator_symbols if sep != '/']
+        if any(sep in content for sep in other_separators):
+            return True
+        
+        return False
     
     def tokenize_content(self, content: str) -> List[Union[str, Tuple[str, str, str]]]:
-        """Fast tokenization with single regex split."""
+        """Fast tokenization with single regex split and special slash handling."""
         result = []
-        parts = self.separator_split_pattern.split(content)
+        
+        # Check if slashes should be treated as separators in this content
+        treat_slash_as_separator = self._should_treat_slash_as_separator(content)
+        
+        # Create dynamic separator pattern based on slash treatment
+        separator_symbols_to_use = set(self.separator_symbols)
+        if treat_slash_as_separator:
+            separator_symbols_to_use.add('/')
+        
+        # Handle HTML entities and tags - normalize &nbsp; before processing
+        normalized_content = content.replace('&nbsp;', ' ')
+        
+        # Create pattern for this specific tokenization - handle HTML tags specially
+        html_tags = ['<br/>', '<br />', '<br>']
+        regular_separators = [sep for sep in separator_symbols_to_use if sep not in html_tags and sep != '&nbsp;']
+        
+        # Build pattern with HTML tags first (longer matches), then regular separators
+        all_separators = html_tags + regular_separators
+        separator_pattern = '|'.join(re.escape(sep) for sep in all_separators)
+        
+        if separator_pattern:
+            dynamic_separator_pattern = re.compile(rf'(\s*)({separator_pattern})(\s*)')
+            parts = dynamic_separator_pattern.split(normalized_content)
+        else:
+            parts = [normalized_content]  # No separators to split on
         
         for part in parts:
             if not part:
                 continue
-            if part.strip() in self.separator_symbols:
+            # Check if this part is a separator (including original &nbsp; check)
+            if (part.strip() in separator_symbols_to_use or 
+                part.strip() in html_tags or 
+                (part.strip() == ' ' and '&nbsp;' in separator_symbols_to_use)):
                 result.append((_STRINGS['separator'], part.strip(), ''))
             elif not part.isspace() and part.strip():
                 space_parts = self.space_pattern.split(part)
@@ -373,25 +437,57 @@ class IPAProcessor:
         return new_nodes, has_valid_conversions
     
     def process_ipa_template(self, node: nodes.Template, parent_list: List, index: int) -> None:
-        """Process IPA template with optimized logic and panphon validation."""
+        """Process IPA template with optimized logic, panphon validation, and improved slash handling."""
         if node.name.strip().lower() != _STRINGS['ipa']:
             return
         
         raw_content = str(node.params[0].value).strip()
+        
+        # First check if this looks like a simple phonemic transcription
+        if raw_content.startswith('/') and raw_content.endswith('/') and raw_content.count('/') == 2:
+            inner_content = raw_content[1:-1].strip()
+            # Check if it contains separators that would make it allophone
+            has_other_separators = any(sep in inner_content for sep in self.separator_symbols if sep != '/')
+            if not has_other_separators:
+                # This is a simple phonemic transcription, convert to IPA link
+                analysis = self.analyze_segment(inner_content)
+                if analysis['should_link'] and analysis['contains_valid_ipa']:
+                    template_name = self.special_brackets.get('/', (None, None))[1]
+                    if template_name:
+                        new_template = self._create_template_node(template_name, inner_content)
+                        parent_list[index:index+1] = [new_template]
+                        self.stats.changes += 1
+                        print(f"Converted phonemic: {raw_content} -> {{{{{template_name}|{inner_content}}}}}")
+                    return
+        
+        # Handle bracketed content with potential separators
         open_b, close_b, inner_content, template_name = self.detect_ipa_brackets(raw_content)
         
-        # Handle content with separators
-        if template_name and any(sep in inner_content for sep in self.separator_symbols):
+        # Determine if we should look for separators (including slash logic)
+        should_check_separators = (
+            any(sep in inner_content for sep in self.separator_symbols) or
+            self._should_treat_slash_as_separator(raw_content)
+        )
+        
+        if should_check_separators:
             segments = self.tokenize_content(inner_content)
             new_nodes, has_valid_conversions = self._process_segments_to_nodes(segments, template_name)
             
             if new_nodes and has_valid_conversions:
-                parent_list[index:index+1] = new_nodes
+                # Add brackets back if they existed
+                final_nodes = []
+                if open_b:
+                    final_nodes.append(nodes.Text(open_b))
+                final_nodes.extend(new_nodes)
+                if close_b:
+                    final_nodes.append(nodes.Text(close_b))
+                
+                parent_list[index:index+1] = final_nodes
                 self.stats.changes += 1
-                print(f"Converted allophone template: {raw_content}")
+                print(f"Converted allophone template with separators: {raw_content}")
             return
         
-        # Handle simple special brackets
+        # Handle simple special brackets without separators
         if template_name and inner_content.strip():
             analysis = self.analyze_segment(inner_content)
             if analysis['should_link'] and analysis['contains_valid_ipa']:
@@ -401,7 +497,7 @@ class IPAProcessor:
                 print(f"Converted: {raw_content} -> {{{{{template_name}|{inner_content.strip()}}}}}")
             return
         
-        # Fallback processing
+        # Fallback processing for unbracketed content
         segments = self.tokenize_content(raw_content)
         new_nodes, has_valid_conversions = self._process_segments_to_nodes(segments)
         
@@ -432,11 +528,18 @@ class IPAProcessor:
             pywikibot.showDiff(text, new_text)
             
             if input("Save changes? (y/n): ").lower() == 'y':
-                page.text = new_text
-                page.save(summary=f"IPA conversion in phonetic tables ({self.stats.changes} templates)", bot=True)
-                return True
-        else:
-            print("No IPA templates needed conversion")
+                try:
+                    page.text = new_text
+                    page.save(summary=f"IPA conversion in phonetic tables ({self.stats.changes} templates)", bot=True)
+                    return True
+                except pywikibot.exceptions.OtherPageSaveError as e:
+                    if "badtoken" in str(e):
+                        print("Token expired, refreshing and retrying...")
+                        self.refresh_tokens()
+                        page.save(summary=f"IPA conversion in phonetic tables ({self.stats.changes} templates)", bot=True)
+                        return True
+                    else:
+                        raise
         
         return False
     
@@ -503,6 +606,13 @@ class IPAProcessor:
         print(f"Made changes to {self.stats.modified_count} pages")
         
         return self.stats.processed_count, self.stats.modified_count
+    
+    def refresh_tokens(self):
+        """Force refresh of authentication tokens."""
+        site = pywikibot.Site('en', 'wikipedia')
+        site.tokens.clear()  # Clear cached tokens
+        site.get_tokens('csrf')  # Get fresh CSRF token
+        print("Authentication tokens refreshed")
     
     def reload_config(self):
         """Reload configuration and clear caches."""
