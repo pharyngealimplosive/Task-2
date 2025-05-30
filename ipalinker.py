@@ -9,6 +9,7 @@ from functools import lru_cache
 import yaml
 import sys
 from pathlib import Path
+import traceback
 
 try:
     import panphon
@@ -38,6 +39,11 @@ class IPAProcessor:
         self.stats = ProcessingStats()
         print(f"IPA Processor initialized with config: {config_path}")
         print("Panphon integration enabled for enhanced IPA detection")
+
+        # Retry configuration
+        self.max_retries = 3
+        self.base_delay = 1.0  # Base delay for exponential backoff
+        self.max_delay = 30.0  # Maximum delay cap
     
     def _init_panphon(self):
         """Initialize panphon for IPA symbol validation."""
@@ -506,8 +512,146 @@ class IPAProcessor:
             self.stats.changes += 1
             print(f"Converted IPA template: {raw_content}")
     
+    def _exponential_backoff_delay(self, attempt: int, base_delay: float = None) -> float:
+        """Calculate exponential backoff delay with jitter."""
+        if base_delay is None:
+            base_delay = self.base_delay
+        
+        # Calculate exponential delay: base_delay * (2 ^ attempt)
+        delay = base_delay * (2 ** attempt)
+        
+        # Cap the delay at max_delay
+        delay = min(delay, self.max_delay)
+        
+        # Add jitter (±20% randomization) to avoid thundering herd
+        jitter = delay * 0.2 * random.uniform(-1, 1)
+        final_delay = delay + jitter
+        
+        return max(0.1, final_delay)  # Ensure minimum 0.1s delay
+        
+    def _handle_page_save_with_retry(self, page: pywikibot.Page, new_text: str, 
+                                   summary: str) -> bool:
+        """Save page with exponential backoff retry logic and comprehensive error handling."""
+        for attempt in range(self.max_retries):
+            try:
+                page.text = new_text
+                page.save(summary=summary, bot=True)
+                print(f"Page saved successfully after {attempt + 1} attempt(s)")
+                return True
+                
+            except pywikibot.exceptions.EditConflictError as e:
+                print(f"Edit conflict on attempt {attempt + 1}: {e}")
+                if attempt < self.max_retries - 1:
+                    delay = self._exponential_backoff_delay(attempt)
+                    print(f"Retrying in {delay:.1f} seconds after refreshing page content...")
+                    time.sleep(delay)
+                    
+                    try:
+                        # Refresh page content and reapply changes
+                        print("Refreshing page content to resolve edit conflict...")
+                        refreshed_text = page.get(force=True)  # Force refresh from server
+                        
+                        # Reprocess the refreshed content
+                        wikicode = parse(refreshed_text)
+                        old_changes = self.stats.changes
+                        self.stats.changes = 0
+                        tables = self.find_tables(refreshed_text)
+                        self._process_nodes_with_context(wikicode.nodes, 0, tables)
+                        
+                        if self.stats.changes > 0:
+                            new_text = str(wikicode)
+                            print(f"Reprocessed content: found {self.stats.changes} changes")
+                        else:
+                            print("No changes found in refreshed content")
+                            return False
+                            
+                    except Exception as refresh_error:
+                        print(f"Error refreshing page content: {refresh_error}")
+                        if attempt == self.max_retries - 1:
+                            return False
+                        continue
+                else:
+                    print("Max retries exceeded for edit conflict")
+                    return False
+                    
+            except pywikibot.exceptions.OtherPageSaveError as e:
+                error_msg = str(e).lower()
+                
+                if "badtoken" in error_msg:
+                    print(f"Bad token error on attempt {attempt + 1}: {e}")
+                    if attempt < self.max_retries - 1:
+                        delay = self._exponential_backoff_delay(attempt, 0.5)
+                        print(f"Refreshing tokens and retrying in {delay:.1f} seconds...")
+                        time.sleep(delay)
+                        self.refresh_tokens()
+                    else:
+                        print("Max retries exceeded for token refresh")
+                        return False
+                        
+                elif "readonly" in error_msg or "database" in error_msg:
+                    print(f"Database/readonly error on attempt {attempt + 1}: {e}")
+                    if attempt < self.max_retries - 1:
+                        delay = self._exponential_backoff_delay(attempt, 2.0)  # Longer delay for DB issues
+                        print(f"Waiting for database availability, retrying in {delay:.1f} seconds...")
+                        time.sleep(delay)
+                    else:
+                        print("Max retries exceeded for database error")
+                        return False
+                        
+                elif "rate" in error_msg or "throttl" in error_msg:
+                    print(f"Rate limiting on attempt {attempt + 1}: {e}")
+                    if attempt < self.max_retries - 1:
+                        delay = self._exponential_backoff_delay(attempt, 3.0)  # Even longer for rate limits
+                        print(f"Rate limited, waiting {delay:.1f} seconds...")
+                        time.sleep(delay)
+                    else:
+                        print("Max retries exceeded for rate limiting")
+                        return False
+                        
+                else:
+                    print(f"Other save error on attempt {attempt + 1}: {e}")
+                    if attempt < self.max_retries - 1:
+                        delay = self._exponential_backoff_delay(attempt)
+                        print(f"Retrying in {delay:.1f} seconds...")
+                        time.sleep(delay)
+                    else:
+                        print("Max retries exceeded for other save error")
+                        return False
+                        
+            except pywikibot.exceptions.LockedPageError as e:
+                print(f"Page is locked: {e}")
+                return False  # Don't retry for locked pages
+                
+            except pywikibot.exceptions.SpamblacklistError as e:
+                print(f"Spam blacklist error: {e}")
+                return False  # Don't retry for spam blacklist
+                
+            except pywikibot.exceptions.TitleblacklistError as e:
+                print(f"Title blacklist error: {e}")
+                return False  # Don't retry for title blacklist
+                
+            except pywikibot.exceptions.AbuseFilterDisallowedError as e:
+                print(f"Abuse filter disallowed the edit: {e}")
+                return False # Don't retry for abuse filter
+            
+            except Exception as e:
+                print(f"Unexpected error on attempt {attempt + 1}: {e}")
+                if attempt < self.max_retries - 1:
+                    delay = self._exponential_backoff_delay(attempt)
+                    print(f"Retrying in {delay:.1f} seconds...")
+                    time.sleep(delay)
+                else:
+                    print("Max retries exceeded for unexpected error")
+                    traceback.print_exc()
+                    return False
+        
+        return False
+    
     def process_page(self, page: pywikibot.Page) -> bool:
-        """Process single page efficiently."""
+        """Process single page efficiently with redirect handling and improved error handling."""
+        # First resolve any redirects
+        page = self._resolve_redirect(page)
+        
         print(f"\nProcessing: {page.title()}")
         
         try:
@@ -515,33 +659,81 @@ class IPAProcessor:
         except pywikibot.exceptions.NoPageError:
             print("Page doesn't exist!")
             return False
+        except pywikibot.exceptions.IsRedirectPageError:
+            print("Unexpected redirect encountered during page fetch")
+            return False
+        except Exception as e:
+            print(f"Error fetching page content: {e}")
+            return False
         
-        wikicode = parse(text)
+        try:
+            wikicode = parse(text)
+        except Exception as e:
+            print(f"Error parsing page wikicode: {e}")
+            return False
+        
+        # Reset stats and process
         self.stats.changes = 0
-        tables = self.find_tables(text)
         
-        self._process_nodes_with_context(wikicode.nodes, 0, tables)
+        try:
+            tables = self.find_tables(text)
+            self._process_nodes_with_context(wikicode.nodes, 0, tables)
+        except Exception as e:
+            print(f"Error processing page content: {e}")
+            return False
         
         if self.stats.changes:
             new_text = str(wikicode)
             print(f"\nFound {self.stats.changes} IPA conversion(s)")
-            pywikibot.showDiff(text, new_text)
+            
+            try:
+                pywikibot.showDiff(text, new_text)
+            except Exception as e:
+                print(f"Error showing diff: {e}")
+                print("Proceeding without diff display...")
             
             if input("Save changes? (y/n): ").lower() == 'y':
-                try:
-                    page.text = new_text
-                    page.save(summary=f"IPA conversion in phonetic tables ({self.stats.changes} templates)", bot=True)
-                    return True
-                except pywikibot.exceptions.OtherPageSaveError as e:
-                    if "badtoken" in str(e):
-                        print("Token expired, refreshing and retrying...")
-                        self.refresh_tokens()
-                        page.save(summary=f"IPA conversion in phonetic tables ({self.stats.changes} templates)", bot=True)
-                        return True
-                    else:
-                        raise
+                summary = f"IPA conversion in phonetic tables ({self.stats.changes} templates)"
+                return self._handle_page_save_with_retry(page, new_text, summary)
+        else:
+            print("No IPA conversions found.")
         
         return False
+
+    def _process_single_page_interactive():
+        """Interactive single page processing with redirect handling."""
+        site = pywikibot.Site('en', 'wikipedia')
+        
+        page_title = input("Enter page title: ").strip()
+        if not page_title:
+            print("No page title provided.")
+            return
+        
+        try:
+            page = pywikibot.Page(site, page_title)
+            
+            # Check if page exists before processing
+            try:
+                if not page.exists():
+                    print(f"Page '{page_title}' does not exist.")
+                    return
+            except Exception as e:
+                print(f"Error checking if page exists: {e}")
+                return
+            
+            # Get processor instance (this would need to be passed in or accessed globally)
+            config_path = getattr(_process_single_page_interactive, 'config_path', 'ipa_config.yaml')
+            processor = IPAProcessor(config_path)
+            
+            success = processor.process_page(page)
+            if success:
+                print("Page processed and saved successfully!")
+            else:
+                print("Page processing completed (no changes saved).")
+                
+        except Exception as e:
+            print(f"Error processing page '{page_title}': {e}")
+            traceback.print_exc()
     
     def _process_nodes_with_context(self, node_list: List[nodes.Node], text_offset: int, tables: List):
         """Process nodes with table context."""
@@ -563,6 +755,50 @@ class IPAProcessor:
             
             current_offset += len(node_str)
             i += 1
+    
+    def _resolve_redirect(self, page: pywikibot.Page) -> pywikibot.Page:
+        """Follow redirects to get the actual target page."""
+        original_title = page.title()
+        
+        try:
+            if page.isRedirectPage():
+                print(f"'{original_title}' is a redirect page.")
+                target = page.getRedirectTarget()
+                print(f"Following redirect to: '{target.title()}'")
+                
+                # Check if the target is also a redirect (handle redirect chains)
+                redirect_chain = [original_title]
+                current_page = target
+                max_redirects = 5  # Prevent infinite loops
+                
+                while current_page.isRedirectPage() and len(redirect_chain) < max_redirects:
+                    redirect_chain.append(current_page.title())
+                    current_page = current_page.getRedirectTarget()
+                    print(f"Following chained redirect to: '{current_page.title()}'")
+                
+                if len(redirect_chain) >= max_redirects:
+                    print(f"Warning: Stopped following redirects after {max_redirects} hops to prevent loops")
+                
+                print(f"Final target page: '{current_page.title()}'")
+                return current_page
+            else:
+                print(f"'{original_title}' is not a redirect page.")
+                return page
+                
+        except pywikibot.exceptions.CircularRedirectError as e:
+            print(f"Circular redirect detected: {e}")
+            print(f"Using original page: '{original_title}'")
+            return page
+            
+        except pywikibot.exceptions.InterwikiRedirectPageError as e:
+            print(f"Interwiki redirect (cannot follow): {e}")
+            print(f"Using original page: '{original_title}'")
+            return page
+            
+        except Exception as e:
+            print(f"Error resolving redirect: {e}")
+            print(f"Using original page: '{original_title}'")
+            return page
     
     def process_category(self, category_name: str, depth: int = 0, 
                         max_pages: Optional[int] = None, skip_pages: int = 0) -> Tuple[int, int]:
@@ -645,11 +881,14 @@ def main():
         print(f"Successfully logged in as: {site.username()}")
         
         config_path = input("Enter config file path (or press Enter for default 'ipa_config.yaml'): ").strip()
-        processor = IPAProcessor(config_path or "ipa_config.yaml")
+        config_path = config_path or "ipa_config.yaml"
+        processor = IPAProcessor(config_path)
+        
+        # Store config_path for the interactive function
+        _process_single_page_interactive.config_path = config_path
         
         menu_options = {
-            '1': ('Process a specific page', lambda: processor.process_page(
-                pywikibot.Page(site, input("Enter page title: ").strip()))),
+            '1': ('Process a specific page', lambda: _process_single_page_with_processor(processor)),
             '2': ('Process a category', lambda: _process_category_interactive(processor)),
             '3': ('Reload configuration', processor.reload_config),
             '4': ('Test IPA symbol validation', lambda: _test_ipa_symbols(processor)),
@@ -675,7 +914,6 @@ def main():
         print("\nOperation interrupted by user.")
     except Exception as e:
         print(f"An error occurred: {e}")
-        import traceback
         traceback.print_exc()
 
 def _process_category_interactive(processor):
@@ -687,6 +925,72 @@ def _process_category_interactive(processor):
     skip_pages = int(input("Enter pages to skip (or enter for none): ").strip() or "0")
     
     processor.process_category(category_name, depth, max_pages, skip_pages)
+
+def _process_single_page_interactive():
+    """Interactive single page processing with redirect handling."""
+    site = pywikibot.Site('en', 'wikipedia')
+    
+    page_title = input("Enter page title: ").strip()
+    if not page_title:
+        print("No page title provided.")
+        return
+    
+    try:
+        page = pywikibot.Page(site, page_title)
+        
+        # Check if page exists before processing
+        try:
+            if not page.exists():
+                print(f"Page '{page_title}' does not exist.")
+                return
+        except Exception as e:
+            print(f"Error checking if page exists: {e}")
+            return
+        
+        # Get processor instance (this would need to be passed in or accessed globally)
+        config_path = getattr(_process_single_page_interactive, 'config_path', 'ipa_config.yaml')
+        processor = IPAProcessor(config_path)
+        
+        success = processor.process_page(page)
+        if success:
+            print("Page processed and saved successfully!")
+        else:
+            print("Page processing completed (no changes saved).")
+            
+    except Exception as e:
+        print(f"Error processing page '{page_title}': {e}")
+        traceback.print_exc()
+
+def _process_single_page_with_processor(processor):
+    """Process single page with existing processor instance."""
+    site = pywikibot.Site('en', 'wikipedia')
+    
+    page_title = input("Enter page title: ").strip()
+    if not page_title:
+        print("No page title provided.")
+        return
+    
+    try:
+        page = pywikibot.Page(site, page_title)
+        
+        # Check if page exists before processing
+        try:
+            if not page.exists():
+                print(f"Page '{page_title}' does not exist.")
+                return
+        except Exception as e:
+            print(f"Error checking if page exists: {e}")
+            return
+        
+        success = processor.process_page(page)
+        if success:
+            print("Page processed and saved successfully!")
+        else:
+            print("Page processing completed (no changes saved).")
+            
+    except Exception as e:
+        print(f"Error processing page '{page_title}': {e}")
+        traceback.print_exc()
 
 def _test_ipa_symbols(processor):
     """Test IPA symbol validation."""
