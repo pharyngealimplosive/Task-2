@@ -1,0 +1,5 @@
+For the bot to work, the following libraries must be installed:
+* pywikibot, which is used for interacting with Wikimedia wikis;
+* mwparserfromhell, for parsing and manipulating wiki markup;
+* panphon, for working with phonetic features and IPA symbols;
+* PyYAML, to load and parse YAML configuration files.
