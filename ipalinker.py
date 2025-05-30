@@ -87,6 +87,7 @@ class IPAProcessor:
         self.non_ipa_diacritics = frozenset(c.get('non_ipa_diacritics', []))
         self.separator_symbols = frozenset(c.get('separator_symbols', []))
         self.phonetic_terms = frozenset(term.lower() for term in c.get('phonetic_terms', []))
+        self.valid_ipa_diacritics = frozenset(c.get('superscripts', []))
     
     def _compile_patterns(self):
         """Compile all regex patterns once."""
@@ -99,8 +100,16 @@ class IPAProcessor:
     @lru_cache(maxsize=2000)
     def is_valid_ipa_symbol(self, char: str) -> bool:
         """Check if a character is a valid IPA symbol using panphon."""
-        if not char or char.isspace() or char in self.non_ipa_diacritics:
+        if not char or char.isspace():
             return False
+        
+        # Check if it's in non-IPA diacritics (should be excluded)
+        if char in self.non_ipa_diacritics:
+            return False
+        
+        # Check if it's a valid IPA diacritic/superscript
+        if char in self.valid_ipa_diacritics:
+            return True
         
         # Use panphon for IPA symbol validation
         if self.ft.fts(char):
@@ -113,8 +122,16 @@ class IPAProcessor:
     @lru_cache(maxsize=1000)
     def _get_phonetic_features(self, char: str) -> Tuple[bool, bool, bool]:
         """Get phonetic features for a character: (is_syllabic, is_sonorant, is_consonantal)"""
-        if not char or char.isspace() or char in self.non_ipa_diacritics:
+        if not char or char.isspace():
             return False, False, False
+        
+        # Don't treat non-IPA diacritics as having phonetic features
+        if char in self.non_ipa_diacritics:
+            return False, False, False
+        
+        # Valid IPA diacritics should not interfere with phonetic analysis
+        if char in self.valid_ipa_diacritics:
+            return False, False, False  # Diacritics don't have primary phonetic features
         
         features = self.ft.fts(char)
         if not features:
@@ -164,7 +181,12 @@ class IPAProcessor:
     
     def _analyze_sound_sequence(self, segment: str) -> Tuple[bool, List[str]]:
         """Analyze sound sequences for invalid patterns."""
-        clean_segment = ''.join(c for c in segment if c not in self.bracket_chars and not c.isspace())
+        # Remove brackets, spaces, and valid diacritics for analysis
+        clean_segment = ''.join(c for c in segment 
+                               if c not in self.bracket_chars 
+                               and not c.isspace() 
+                               and c not in self.valid_ipa_diacritics)
+        
         if not clean_segment:
             return False, []
         
@@ -217,10 +239,13 @@ class IPAProcessor:
         contains_valid_ipa = any(self.is_valid_ipa_symbol(char) for char in seg_clean) if seg_clean.strip() else False
         
         has_tone = any(c in self.tone_symbols for c in segment) or segment in self.tone_symbols
+        
+        # Updated to not treat valid IPA diacritics as non-IPA
         has_non_ipa = any(c in self.non_ipa_diacritics for c in unicodedata.normalize('NFD', seg_clean))
         
-        # Count vowels for diphthong detection
-        vowel_count, _ = self._count_vowels_and_get_type(seg_clean)
+        # Count vowels for diphthong detection (excluding diacritics)
+        clean_for_vowel_count = ''.join(c for c in seg_clean if c not in self.valid_ipa_diacritics)
+        vowel_count, _ = self._count_vowels_and_get_type(clean_for_vowel_count)
         is_diphthong = vowel_count >= 2
         
         # Check for invalid sequences
