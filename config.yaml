@@ -144,12 +144,17 @@ phonetic_terms:
 # Separator sets for tokenization
 separator_symbols:
   - "~"
+  - "⁓"
   - ","
   - "•"
   - "&nbsp;"
   - "<br/>"
   - "<br />"
   - "<br>"
+  - "-"
+  - "–"
+  - "—"
+  - "―"
 
 # Multi-character IPA exceptions that should be treated as single units
 multi_char_exceptions:
