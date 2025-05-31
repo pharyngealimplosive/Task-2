@@ -113,6 +113,10 @@ class IPAProcessor:
         if char in self.non_ipa_diacritics:
             return False
         
+        # Ejective marker is a valid IPA symbol
+        if char == 'ʼ':  # U+02BC MODIFIER LETTER APOSTROPHE
+            return True
+        
         # Check if it's a valid IPA diacritic/superscript
         if char in self.valid_ipa_diacritics:
             return True
@@ -135,6 +139,11 @@ class IPAProcessor:
         if char in self.non_ipa_diacritics:
             return False, False, False
         
+        # Ejective marker itself doesn't have primary phonetic features
+        # but shouldn't block analysis of the base sound
+        if char == 'ʼ':
+            return False, False, False
+        
         # Valid IPA diacritics should not interfere with phonetic analysis
         if char in self.valid_ipa_diacritics:
             return False, False, False  # Diacritics don't have primary phonetic features
@@ -144,9 +153,10 @@ class IPAProcessor:
             # Try normalized form
             normalized = unicodedata.normalize('NFD', char)
             for c in normalized:
-                features = self.ft.fts(c)
-                if features:
-                    break
+                if c != 'ʼ':  # Skip ejective marker in normalized analysis
+                    features = self.ft.fts(c)
+                    if features:
+                        break
         
         if not features:
             return False, False, False
@@ -182,16 +192,37 @@ class IPAProcessor:
     def _is_valid_consonant_cluster(self, cluster: str) -> bool:
         """Check if a consonant cluster is valid based on multi_char_exceptions."""
         normalized = unicodedata.normalize('NFD', cluster)
-        base_cluster = ''.join(c for c in normalized if not unicodedata.category(c).startswith('M'))
-        return base_cluster in self.multi_char_exceptions
+        
+        # Remove combining marks but preserve ejective markers
+        base_cluster = ''
+        for c in normalized:
+            if c == 'ʼ':  # Keep ejective markers
+                base_cluster += c
+            elif not unicodedata.category(c).startswith('M'):  # Keep non-combining marks
+                base_cluster += c
+        
+        # Check both with and without ejective for flexibility
+        variants_to_check = [base_cluster]
+        if 'ʼ' in base_cluster:
+            variants_to_check.append(base_cluster.replace('ʼ', ''))
+        
+        return any(variant in self.multi_char_exceptions for variant in variants_to_check)
     
     def _analyze_sound_sequence(self, segment: str) -> Tuple[bool, List[str]]:
         """Analyze sound sequences for invalid patterns."""
         # Remove brackets, spaces, and valid diacritics for analysis
-        clean_segment = ''.join(c for c in segment 
-                               if c not in self.bracket_chars 
-                               and not c.isspace() 
-                               and c not in self.valid_ipa_diacritics)
+        # But preserve ejective markers as they're part of the sound
+        clean_segment = ''
+        i = 0
+        while i < len(segment):
+            char = segment[i]
+            if char in self.bracket_chars or char.isspace():
+                pass  # Skip brackets and spaces
+            elif char in self.valid_ipa_diacritics and char != 'ʼ':
+                pass  # Skip regular diacritics but keep ejective markers
+            else:
+                clean_segment += char
+            i += 1
         
         if not clean_segment:
             return False, []
@@ -199,11 +230,27 @@ class IPAProcessor:
         normalized = unicodedata.normalize('NFD', clean_segment)
         sound_data = []
         
-        for char in normalized:
-            if not unicodedata.category(char).startswith('M'):  # Skip combining marks/diacritics
+        i = 0
+        while i < len(normalized):
+            char = normalized[i]
+            
+            # Handle ejective sequences as single units
+            if i < len(normalized) - 1 and normalized[i + 1] == 'ʼ':
+                # Treat base + ejective as single sound unit
+                base_char = normalized[i]
+                if not unicodedata.category(base_char).startswith('M'):
+                    _, sound_type = self._count_vowels_and_get_type(base_char)
+                    if sound_type != 'other':
+                        sound_data.append((base_char + 'ʼ', sound_type))
+                i += 2  # Skip both base and ejective
+            elif not unicodedata.category(char).startswith('M') and char != 'ʼ':
+                # Regular character (not combining mark, not standalone ejective)
                 _, sound_type = self._count_vowels_and_get_type(char)
                 if sound_type != 'other':
                     sound_data.append((char, sound_type))
+                i += 1
+            else:
+                i += 1
         
         if len(sound_data) < 2:
             return False, []
@@ -241,16 +288,63 @@ class IPAProcessor:
         """Single-pass segment analysis with caching and panphon integration."""
         seg_clean = ''.join(c for c in segment if c not in self.bracket_chars and not c.isspace())
         
-        # Enhanced IPA validation with panphon
-        contains_valid_ipa = any(self.is_valid_ipa_symbol(char) for char in seg_clean) if seg_clean.strip() else False
+        # Enhanced IPA validation with panphon - properly handle complex ejectives
+        contains_valid_ipa = False
+        if seg_clean.strip():
+            # First check if the entire segment contains valid IPA
+            if any(self.is_valid_ipa_symbol(c) for c in seg_clean if c != 'ʼ'):
+                contains_valid_ipa = True
+            
+            # Special handling for ejective sequences (including complex ones like t͡ʃʼ)
+            if not contains_valid_ipa and 'ʼ' in seg_clean:
+                # Find ejective marker positions
+                ejective_pos = seg_clean.find('ʼ')
+                while ejective_pos != -1:
+                    # Check the sequence before the ejective marker
+                    if ejective_pos > 0:
+                        # For affricates like t͡ʃʼ, check the whole sequence before ʼ
+                        base_sequence = seg_clean[:ejective_pos]
+                        
+                        # Check if base sequence contains valid IPA characters
+                        has_valid_base = False
+                        for char in base_sequence:
+                            if self.is_valid_ipa_symbol(char):
+                                has_valid_base = True
+                                break
+                        
+                        # Also check if it's a known multi-character exception (like t͡ʃ)
+                        if has_valid_base or base_sequence in self.multi_char_exceptions:
+                            contains_valid_ipa = True
+                            break
+                    
+                    # Find next ejective marker
+                    ejective_pos = seg_clean.find('ʼ', ejective_pos + 1)
         
         has_tone = any(c in self.tone_symbols for c in segment) or segment in self.tone_symbols
         
-        # Updated to not treat valid IPA diacritics as non-IPA
-        has_non_ipa = any(c in self.non_ipa_diacritics for c in unicodedata.normalize('NFD', seg_clean))
+        # Check for non-IPA diacritics (but preserve ejectives)
+        has_non_ipa = False
+        normalized_seg = unicodedata.normalize('NFD', seg_clean)
+        for char in normalized_seg:
+            # Don't treat ejective markers as non-IPA
+            if char == 'ʼ':
+                continue
+            if char in self.non_ipa_diacritics:
+                has_non_ipa = True
+                break
         
-        # Count vowels for diphthong detection (excluding diacritics)
-        clean_for_vowel_count = ''.join(c for c in seg_clean if c not in self.valid_ipa_diacritics)
+        # Count vowels for diphthong detection (preserve ejectives in the sequence)
+        clean_for_vowel_count = ''
+        i = 0
+        while i < len(seg_clean):
+            char = seg_clean[i]
+            # Keep ejective markers in vowel counting, skip other diacritics
+            if char in self.valid_ipa_diacritics and char != 'ʼ':
+                pass  # Skip regular diacritics but keep ejective markers
+            else:
+                clean_for_vowel_count += char
+            i += 1
+        
         vowel_count, _ = self._count_vowels_and_get_type(clean_for_vowel_count)
         is_diphthong = vowel_count >= 2
         
@@ -503,7 +597,18 @@ class IPAProcessor:
                 print(f"Converted: {raw_content} -> {{{{{template_name}|{inner_content.strip()}}}}}")
             return
         
-        # Fallback processing for unbracketed content
+        # Handle simple unbracketed content - this is the key fix
+        if not template_name and inner_content.strip():
+            analysis = self.analyze_segment(inner_content)
+            if analysis['should_link'] and analysis['contains_valid_ipa']:
+                # Convert simple IPA content to IPA link template
+                new_template = self._create_template_node(_STRINGS['IPA link'], inner_content)
+                parent_list[index:index+1] = [new_template]
+                self.stats.changes += 1
+                print(f"Converted simple IPA: {raw_content} -> {{{{{_STRINGS['IPA link']}|{inner_content.strip()}}}}}")
+            return
+        
+        # Fallback processing for complex unbracketed content with separators
         segments = self.tokenize_content(raw_content)
         new_nodes, has_valid_conversions = self._process_segments_to_nodes(segments)
         
