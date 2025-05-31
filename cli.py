@@ -1,4 +1,5 @@
 from ipa_processor import IPAProcessor
+import traceback
 
 def main():
     """Main entry point with consolidated menu logic."""
