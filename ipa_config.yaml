@@ -160,6 +160,7 @@ separator_symbols:
 multi_char_exceptions:
   - "kp"
   - "gb"
+  - "ɡ͡b"
   - "ŋm"
   - "tp"
   - "db"
@@ -222,6 +223,16 @@ multi_char_exceptions:
   - "ɡʟ̝"
   - "ʈʂ"
   - "ɖʐ"
+  - "ʧ"
+  - "ʤ"
+  - "ʦ"
+  - "ʣ"
+  - "𝼜"
+  - "𝼙"
+  - "ʨ"
+  - "ʥ"
+  - "ꭧ"
+  - "ꭦ"
 
 superscripts:
   - "ᵐ"
@@ -252,3 +263,4 @@ superscripts:
   - "ʲ"
   - "ʷ"
   - "ᶣ"
+  - "ˀ"
