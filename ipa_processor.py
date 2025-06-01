@@ -125,12 +125,8 @@ class IPAProcessor:
         if char == 'ʼ':  # U+02BC MODIFIER LETTER APOSTROPHE
             return True
         
-        # Length marker is a valid IPA symbol
-        if char == 'ː':  # U+02D0 MODIFIER LETTER TRIANGULAR COLON
-            return True
-    
-        # Half-length marker is a valid IPA symbol
-        if char == 'ˑ':  # U+02D1 MODIFIER LETTER HALF TRIANGULAR COLON
+        # Length markers are valid IPA symbols
+        if char in ['ː', 'ˑ']:  # U+02D0 and U+02D1 - length markers
             return True
     
         # Use panphon for IPA symbol validation
@@ -651,7 +647,7 @@ class IPAProcessor:
         return template
     
     def _process_segments_to_nodes(self, segments: List, template_name: str = None) -> Tuple[List[nodes.Node], bool]:
-        """Convert segments to nodes with validation."""
+        """Convert segments to nodes with validation and proper bracket preservation."""
         new_nodes = []
         has_valid_conversions = False
         default_template = template_name or _STRINGS['IPA link']
@@ -674,6 +670,8 @@ class IPAProcessor:
                 # Handle bracketed content
                 open_b, close_b, core, bracket_template = self.detect_ipa_brackets(segment)
                 if not core.strip():
+                    # If no core content, add the original segment as text
+                    new_nodes.append(nodes.Text(segment))
                     continue
                 
                 analysis = self.analyze_segment(core)
@@ -681,27 +679,31 @@ class IPAProcessor:
                 if not analysis['should_link'] or not analysis['contains_valid_ipa']:
                     if not template_name:  # Only return empty for full replacement
                         return [], False
+                    # Preserve original segment including brackets
                     new_nodes.append(nodes.Text(segment))
                     continue
                 
                 has_valid_conversions = True
                 
-                # Add opening bracket if present
-                if open_b:
-                    new_nodes.append(nodes.Text(open_b))
-                
-                # Create appropriate template
-                used_template = bracket_template or default_template
-                new_nodes.append(self._create_template_node(used_template, core))
-                
-                # Add closing bracket if present
-                if close_b:
-                    new_nodes.append(nodes.Text(close_b))
+                # FIXED: For special brackets, DON'T add brackets separately - the template handles them
+                if bracket_template:
+                    # Special brackets: template includes the bracket styling, don't add brackets
+                    new_nodes.append(self._create_template_node(bracket_template, core))
+                else:
+                    # Regular brackets: add brackets and use default template
+                    if open_b:
+                        new_nodes.append(nodes.Text(open_b))
+                    
+                    used_template = default_template
+                    new_nodes.append(self._create_template_node(used_template, core))
+                    
+                    if close_b:
+                        new_nodes.append(nodes.Text(close_b))
         
         return new_nodes, has_valid_conversions
     
     def process_ipa_template(self, node: nodes.Template, parent_list: List, index: int) -> None:
-        """Process IPA template with optimized logic, panphon validation, and improved slash handling."""
+        """Process IPA template with optimized logic, panphon validation, and improved bracket preservation."""
         if node.name.strip().lower() != _STRINGS['ipa']:
             return
         
@@ -718,6 +720,7 @@ class IPAProcessor:
                 if analysis['should_link'] and analysis['contains_valid_ipa']:
                     template_name = self.special_brackets.get('/', (None, None))[1]
                     if template_name:
+                        # FIXED: Special brackets - template handles brackets, don't add extra
                         new_template = self._create_template_node(template_name, inner_content)
                         parent_list[index:index+1] = [new_template]
                         self.stats.changes += 1
@@ -738,12 +741,12 @@ class IPAProcessor:
             new_nodes, has_valid_conversions = self._process_segments_to_nodes(segments, template_name)
             
             if new_nodes and has_valid_conversions:
-                # Add brackets back if they existed
+                # FIXED: For special brackets, don't add brackets - templates handle them
                 final_nodes = []
-                if open_b:
+                if open_b and not template_name:  # Only add brackets if NOT using special template
                     final_nodes.append(nodes.Text(open_b))
                 final_nodes.extend(new_nodes)
-                if close_b:
+                if close_b and not template_name:  # Only add brackets if NOT using special template
                     final_nodes.append(nodes.Text(close_b))
                 
                 parent_list[index:index+1] = final_nodes
@@ -755,14 +758,15 @@ class IPAProcessor:
         if template_name and inner_content.strip():
             analysis = self.analyze_segment(inner_content)
             if analysis['should_link'] and analysis['contains_valid_ipa']:
+                # FIXED: Special brackets - template handles brackets, don't add extra
                 new_template = self._create_template_node(template_name, inner_content)
                 parent_list[index:index+1] = [new_template]
                 self.stats.changes += 1
                 print(f"Converted: {raw_content} -> {{{{{template_name}|{inner_content.strip()}}}}}")
             return
         
-        # Handle simple unbracketed content - this is the key fix
-        if not template_name and inner_content.strip():
+        # Handle simple unbracketed content
+        if not template_name and inner_content.strip() and not open_b and not close_b:
             analysis = self.analyze_segment(inner_content)
             if analysis['should_link'] and analysis['contains_valid_ipa']:
                 # Convert simple IPA content to IPA link template
@@ -770,6 +774,21 @@ class IPAProcessor:
                 parent_list[index:index+1] = [new_template]
                 self.stats.changes += 1
                 print(f"Converted simple IPA: {raw_content} -> {{{{{_STRINGS['IPA link']}|{inner_content.strip()}}}}}")
+            return
+        
+        # Handle cases where we have brackets but no special template (like parentheses)
+        if open_b and close_b and not template_name and inner_content.strip():
+            analysis = self.analyze_segment(inner_content)
+            if analysis['should_link'] and analysis['contains_valid_ipa']:
+                # Preserve brackets and convert content to IPA link
+                new_nodes = [
+                    nodes.Text(open_b),
+                    self._create_template_node(_STRINGS['IPA link'], inner_content),
+                    nodes.Text(close_b)
+                ]
+                parent_list[index:index+1] = new_nodes
+                self.stats.changes += 1
+                print(f"Converted bracketed IPA: {raw_content} -> {open_b}{{{{{_STRINGS['IPA link']}|{inner_content.strip()}}}}}{close_b}")
             return
         
         # Fallback processing for complex unbracketed content with separators
