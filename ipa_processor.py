@@ -15,8 +15,11 @@ try:
     import panphon
 except ImportError:
     print("Error: panphon is required but not installed.")
-    print("Please install it with: !pip install panphon")
-    sys.exit(127) # Exit code 127: command/module not found
+    try:
+        !pip install panphon
+    except:
+        print("Could not install panphon. Please install it with: !pip install panphon")
+        sys.exit(127) # Exit code 127: command/module not found
 
 # Pre-intern common strings for performance
 _STRINGS = {s: sys.intern(s) for s in ['ipa', 'separator', 'IPA link']}
