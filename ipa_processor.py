@@ -16,7 +16,7 @@ try:
 except ImportError:
     print("Error: panphon is required but not installed.")
     print("Installing panphon...")
-    result = !pip install panphon
+    !pip install panphon
     
     # Check if installation was successful by trying to import again
     try:
