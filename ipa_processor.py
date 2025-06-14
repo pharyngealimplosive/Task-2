@@ -29,12 +29,12 @@ except ImportError:
 # Pre-intern common strings for performance
 _STRINGS = {s: sys.intern(s) for s in ['ipa', 'separator', 'IPA link']}
 
-@dataclass
+@dataclass(slots=True)
 class ProcessingStats:
-    __slots__ = ['changes', 'processed_count', 'modified_count', 'skipped_count']
-    
-    def __init__(self):
-        self.changes = self.processed_count = self.modified_count = self.skipped_count = 0
+    changes: int = 0
+    processed_count: int = 0
+    modified_count: int = 0
+    skipped_count: int = 0
 
 class IPAProcessor:
     """Optimized IPA processor with panphon integration."""
