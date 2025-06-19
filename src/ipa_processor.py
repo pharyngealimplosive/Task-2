@@ -23,7 +23,7 @@ except ImportError:
         import panphon
         print("panphon installed and imported successfully!")
     except ImportError:
-        print("Could not install panphon. Please install it manually with: pip install panphon")
+        print("Could not install panphon. Please install it manually with: !pip install panphon")
         sys.exit(127)  # Exit code 127: command/module not found
 
 # Pre-intern common strings for performance
